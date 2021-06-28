@@ -1,15 +1,15 @@
 #ifdef SEEEDUINO_H7AI
-
 #include "Seeed_SDMMC_Interface.h"
+extern "C"{
 #include "stm32h7xx_hal.h"
 #include "../fatfs/diskio.h"
 #include "../fatfs/ffconf.h"
 #include "../fatfs/ff.h"
 
 /* SD status structure definition */
-#define   MSD_OK                        ((uint8_t)0)
-#define   MSD_ERROR                     ((uint8_t)1)
-#define   MSD_ERROR_SD_NOT_PRESENT      ((uint8_t)2)
+#define   MSD_OK                        ((uint8_t)0x00)
+#define   MSD_ERROR                     ((uint8_t)0x01)
+#define   MSD_ERROR_SD_NOT_PRESENT      ((uint8_t)0x02)
 
 /* Common Error codes */
 #define BSP_ERROR_NONE                    0
@@ -86,7 +86,7 @@ __ALIGN_BEGIN static uint8_t scratch[BLOCKSIZE] __ALIGN_END;
 
 
 SD_HandleTypeDef hsd1;
-static volatile DSTATUS SD_State = STA_NOINIT;
+static volatile DSTATUS Stat = STA_NOINIT;
 static volatile UINT    ReadStatus  = 0;
 static volatile UINT    WriteStatus = 0;
 
@@ -95,6 +95,75 @@ static void SD_ClockConfig(void)
 
 }
 
+void DLYB_SDMMC1_Calibration(uint8_t phase)
+{
+	int flag = 0;
+	uint32_t LNGG = 0;
+	uint32_t LNG[3];
+	uint32_t UnitDelayNum = 0;
+	uint32_t TimeOut = 0;
+
+	/*配置延迟线长度为1个完整输入时钟周期*/
+	DLYB_SDMMC1->CR 	|= 0x03;				//使能delay block和length sampling
+	DLYB_SDMMC1->CFGR &= ( ~ (0xf) );			//设置SEL为12，即使能所有的Delay Unit
+	DLYB_SDMMC1->CFGR |= 12;
+
+	for(uint8_t i = 0;i < 128;i ++)
+	{
+		DLYB_SDMMC1->CFGR &= ( ~ (0x7f<<8) ); 	//清零UNIT
+		DLYB_SDMMC1->CFGR |= (i << 8);			//设置UNIT
+		while( !( (DLYB_SDMMC1->CFGR>>31) & 0x01) )		//LNGF被置为1
+		{
+			TimeOut ++;
+			if(TimeOut > 0xffff)
+			{
+				break;
+			}
+		}
+		if( ( (DLYB_SDMMC1->CFGR>>31) & 0x01) )			//LNGF被置为1
+		{
+			flag = 1;
+		}
+
+		if(flag)
+		{
+			LNGG = (DLYB_SDMMC1->CFGR >> 16) & 0xfff;
+			LNG[0] = LNGG & 0x7ff;
+			LNG[1] = (LNGG >> 10) & 0x01;
+			LNG[2] = (LNGG >> 11) & 0x01;
+			if( (LNG[0] > 0) && ( (LNG[1] == 0) || (LNG[2] == 0) ) )	//判断Delay Line Length是否合理
+			{
+				Serial.println("The Delay Line is set one input clock period\r\n");
+				break;
+			}
+			else
+			{
+				flag = 0;
+			}
+		}
+		else	Serial.println("The Delay Line is set err\r\n");
+	}
+
+
+	/*确定有多少个Unit Delay，跨越一个输入时钟周期*/
+	for(int8_t i = 10;i >= 0;i --)
+	{
+		if( (LNGG >> i) & 0x01 )
+		{
+			Serial.print("UnitDelayNum is ");
+      Serial.println(i);
+			UnitDelayNum = i;
+			break;
+		}
+	}
+
+	/*选择输出时钟相位*/
+	DLYB_SDMMC1->CFGR &= ( ~ (0xf) );
+	DLYB_SDMMC1->CFGR |= phase;
+
+	//失能Sampler length enable bit
+	DLYB_SDMMC1->CR 	&= ( ~ ( 1 << 1 ) );
+}
 
 uint8_t MX_SDMMC1_SD_Init(void)
 {
@@ -111,11 +180,11 @@ uint8_t MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 5;
+  hsd1.Init.ClockDiv = 4;
   hsd1.Init.TranceiverPresent = SDMMC_TRANSCEIVER_NOT_PRESENT;
-  while (HAL_SD_Init(&hsd1) != HAL_OK)
+  if(HAL_SD_Init(&hsd1) != HAL_OK)
   {
-    //return  HAL_ERROR;
+    return  HAL_ERROR;
   }
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
@@ -209,13 +278,13 @@ static int32_t BSP_SD_GetCardState(uint32_t Instance)
 
 static DSTATUS SD_CheckStatus(BYTE lun)
 {
-  SD_State = STA_NOINIT;
+  Stat = STA_NOINIT;
 
-  if(BSP_SD_GetCardState(0) == BSP_ERROR_NONE)
+  if(BSP_SD_GetCardState(0) == MSD_OK)
   {
-    SD_State &= ~STA_NOINIT;
+    Stat &= ~STA_NOINIT;
   }
-  return SD_State;
+  return Stat;
 }
 
 static int SD_CheckStatusWithTimeout(uint32_t timeout)
@@ -295,22 +364,9 @@ int32_t BSP_SD_WriteBlocks_DMA(uint32_t Instance, uint32_t *pData, uint32_t Bloc
 
 int32_t BSP_SD_GetCardInfo(uint32_t Instance, HAL_SD_CardInfoTypeDef *CardInfo)
 {
-  int32_t ret;
-
-  if(Instance >= SD_INSTANCES_NBR)
-  {
-    ret = BSP_ERROR_WRONG_PARAM;
-  }
-  else if(HAL_SD_GetCardInfo(&hsd1, CardInfo) != HAL_OK)
-  {
-    ret = BSP_ERROR_PERIPH_FAILURE;
-  }
-  else
-  {
-    ret = BSP_ERROR_NONE;
-  }
-  /* Return BSP status */
-  return ret;
+  /* Get SD card Information */
+  HAL_SD_GetCardInfo(&hsd1, CardInfo);
+  return Instance;
 }
 
 /**
@@ -376,12 +432,9 @@ __weak uint8_t BSP_SD_WriteBlocks(uint32_t *pData, uint32_t WriteAddr, uint32_t 
 
 DSTATUS SD_initialize(BYTE pdrv)
 {
-    SD_ClockConfig();
-    if(MX_SDMMC1_SD_Init()== BSP_ERROR_NONE)
-    {
-        SD_State = SD_CheckStatus(pdrv);
-    }
-    return SD_State;
+    Stat = STA_NOINIT;
+    Stat = SD_CheckStatus(pdrv);
+    return Stat;
 }
 
 DSTATUS SD_status(BYTE pdrv)
@@ -412,10 +465,10 @@ DRESULT SD_write(BYTE pdrv, const BYTE* buff, DWORD sector, UINT count)
 
   if(BSP_SD_WriteBlocks((uint32_t*)buff,
                         (uint32_t)(sector),
-                        count, SD_TIMEOUT) == 0)
+                        count, SD_TIMEOUT) == MSD_OK)
   {
 	/* wait until the Write operation is finished */
-    while(BSP_SD_GetCardState(0) != 0)
+    while(BSP_SD_GetCardState(0) != MSD_OK)
     {
     }
     res = RES_OK;
@@ -429,7 +482,7 @@ DRESULT SD_ioctl(BYTE pdrv, BYTE cmd, void* buff)
   uint8_t res = RES_ERROR;
   HAL_SD_CardInfoTypeDef CardInfo;
 
-  if (SD_State & STA_NOINIT) return RES_NOTRDY;
+  if (Stat & STA_NOINIT) return RES_NOTRDY;
 
   switch (cmd)
   {
@@ -440,20 +493,23 @@ DRESULT SD_ioctl(BYTE pdrv, BYTE cmd, void* buff)
 
   /* Get number of sectors on the disk (DWORD) */
   case GET_SECTOR_COUNT :
-    res = BSP_SD_GetCardInfo(0, &CardInfo);
+    BSP_SD_GetCardInfo(0, &CardInfo);
     *(DWORD*)buff = CardInfo.LogBlockNbr;
+    res = RES_OK;
     break;
 
   /* Get R/W sector size (WORD) */
   case GET_SECTOR_SIZE :
-    res = BSP_SD_GetCardInfo(0, &CardInfo);
+    BSP_SD_GetCardInfo(0, &CardInfo);
     *(WORD*)buff = CardInfo.LogBlockSize;
+    res = RES_OK;
     break;
 
   /* Get erase block size in unit of sector (DWORD) */
   case GET_BLOCK_SIZE :
-    res = BSP_SD_GetCardInfo(0, &CardInfo);
+    BSP_SD_GetCardInfo(0, &CardInfo);
     *(DWORD*)buff = CardInfo.LogBlockSize / SD_DEFAULT_BLOCK_SIZE;
+    res = RES_OK;
     break;
 
   default:
@@ -461,5 +517,5 @@ DRESULT SD_ioctl(BYTE pdrv, BYTE cmd, void* buff)
   }
   return (DRESULT)res;
 }
-
+}
 #endif

@@ -260,6 +260,7 @@ namespace fs {
             this->_fno = f._fno;
             strcpy(this->_name, f._name); 
         }
+        return *this;
      }
 
 
